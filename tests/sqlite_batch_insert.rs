@@ -376,4 +376,39 @@ mod returning {
         // rows skipped due to the conflict do not return anything
         assert_eq!(names, vec!["Sean", "Jim"]);
     }
+
+    #[tokio::test]
+    async fn batch_insert_with_default_values_returning_is_atomic() {
+        let conn = &mut connection().await;
+        setup(conn).await;
+
+        let result = diesel::insert_into(batch_users::table)
+            .values(&vec![
+                NewUserWithId {
+                    id: 1,
+                    name: "Sean",
+                    hair_color: None,
+                },
+                NewUserWithId {
+                    id: 1,
+                    name: "Tess",
+                    hair_color: None,
+                },
+            ])
+            .returning(batch_users::name)
+            .get_results::<String>(conn)
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(diesel::result::Error::DatabaseError(
+                    diesel::result::DatabaseErrorKind::UniqueViolation,
+                    _
+                ))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(load_users(conn).await, owned(&[]));
+    }
 }
