@@ -15,6 +15,8 @@ mod notifications;
 #[cfg(any(feature = "bb8", feature = "deadpool", feature = "mobc"))]
 mod pooling;
 mod run_query_dsl_impl_match;
+#[cfg(feature = "sqlite")]
+mod sqlite_batch_insert;
 #[cfg(feature = "async-connection-wrapper")]
 mod sync_wrapper;
 mod transactions;
@@ -107,17 +109,11 @@ type TestBackend = <TestConnection as AsyncConnectionCore>::Backend;
 #[tokio::test]
 async fn test_basic_insert_and_load() -> QueryResult<()> {
     let conn = &mut connection().await;
-    // Insertion split into 2 since Sqlite batch insert isn't supported for diesel_async yet
     let res = diesel::insert_into(users::table)
-        .values(users::name.eq("John Doe"))
+        .values([users::name.eq("John Doe"), users::name.eq("Jane Doe")])
         .execute(conn)
         .await;
-    assert_eq!(res, Ok(1), "User count does not match");
-    let res = diesel::insert_into(users::table)
-        .values(users::name.eq("Jane Doe"))
-        .execute(conn)
-        .await;
-    assert_eq!(res, Ok(1), "User count does not match");
+    assert_eq!(res, Ok(2), "User count does not match");
     let users = users::table.load::<User>(conn).await?;
     assert_eq!(&users[0].name, "John Doe", "User name [0] does not match");
     assert_eq!(&users[1].name, "Jane Doe", "User name [1] does not match");

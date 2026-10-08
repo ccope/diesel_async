@@ -118,6 +118,36 @@ mod implementation {
         )
     }
 
+    /// Collect the SQL and the bind values of the given query, so that the
+    /// query can be moved to another thread
+    fn prepare_query<C, MD, Q>(inner: &mut C, query: &Q) -> QueryResult<CollectedQuery<MD>>
+    where
+        <C as Connection>::Backend: std::default::Default,
+        <C::Backend as Backend>::QueryBuilder: std::default::Default,
+        C: Connection + WithMetadataLookup,
+        for<'b> <C::Backend as Backend>::BindCollector<'b>:
+            MoveableBindCollector<C::Backend, BindData = MD> + std::default::Default,
+        Q: QueryFragment<C::Backend> + QueryId,
+    {
+        let backend = C::Backend::default();
+
+        let mut bind_collector = <<C::Backend as Backend>::BindCollector<'_> as Default>::default();
+        let metadata_lookup = inner.metadata_lookup();
+        query.collect_binds(&mut bind_collector, metadata_lookup, &backend)?;
+        let collector_data = bind_collector.moveable();
+
+        let mut query_builder = <<C::Backend as Backend>::QueryBuilder as Default>::default();
+        query.to_sql(&mut query_builder, &backend)?;
+        let sql = query_builder.finish();
+        let is_safe_to_cache_prepared = query.is_safe_to_cache_prepared(&backend)?;
+
+        Ok(CollectedQuery::new(
+            sql,
+            is_safe_to_cache_prepared,
+            collector_data,
+        ))
+    }
+
     pub struct SyncConnectionWrapper<C, S> {
         inner: Arc<Mutex<C>>,
         runtime: S,
@@ -196,6 +226,85 @@ mod implementation {
             self.execute_with_prepared_query(source, |conn, query| {
                 conn.execute_returning_count(&query)
             })
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    impl<C, S, MD, O> crate::methods::ExecuteStatementsInTransaction for SyncConnectionWrapper<C, S>
+    where
+        // Backend bounds
+        <C as Connection>::Backend: std::default::Default + DieselReserveSpecialization,
+        <C::Backend as Backend>::QueryBuilder: std::default::Default,
+        // Connection bounds
+        C: Connection + LoadConnection + WithMetadataLookup + 'static,
+        <C as Connection>::TransactionManager: Send,
+        // BindCollector bounds
+        MD: Send + 'static,
+        for<'a> <C::Backend as Backend>::BindCollector<'a>:
+            MoveableBindCollector<C::Backend, BindData = MD> + std::default::Default,
+        // Row bounds
+        O: 'static + Send + for<'conn> diesel::row::Row<'conn, C::Backend>,
+        for<'conn, 'query> <C as LoadConnection>::Row<'conn, 'query>:
+            IntoOwnedRow<'conn, <C as Connection>::Backend, OwnedRow = O>,
+        // SpawnBlocking bounds
+        S: SpawnBlocking + Send,
+    {
+        fn execute_statements_in_transaction<'conn, 'query, T>(
+            &'conn mut self,
+            statements: Vec<T>,
+        ) -> Self::ExecuteFuture<'conn, 'query>
+        where
+            T: QueryFragment<Self::Backend> + QueryId + 'query,
+        {
+            let queries = self.with_inner(|inner| {
+                statements
+                    .iter()
+                    .map(|statement| prepare_query(inner, statement))
+                    .collect::<QueryResult<Vec<_>>>()
+            });
+
+            self.spawn_blocking(|inner| {
+                let queries = queries?;
+                inner.transaction(|inner| {
+                    queries.iter().try_fold(0, |count, query| {
+                        Ok(count + inner.execute_returning_count(query)?)
+                    })
+                })
+            })
+        }
+
+        fn load_statements_in_transaction<'conn, 'query, T>(
+            &'conn mut self,
+            statements: Vec<T>,
+        ) -> Self::LoadFuture<'conn, 'query>
+        where
+            T: AsQuery + 'query,
+            T::Query: QueryFragment<Self::Backend> + QueryId + 'query,
+        {
+            let queries = self.with_inner(|inner| {
+                statements
+                    .into_iter()
+                    .map(|statement| prepare_query(inner, &statement.as_query()))
+                    .collect::<QueryResult<Vec<_>>>()
+            });
+
+            self.spawn_blocking(|inner| {
+                let queries = queries?;
+                inner.transaction(|inner| {
+                    let mut out = Vec::with_capacity(queries.len());
+                    for query in &queries {
+                        let mut cache = <<<C as LoadConnection>::Row<'_, '_> as IntoOwnedRow<
+                            <C as Connection>::Backend,
+                        >>::Cache as Default>::default();
+                        for row in inner.load(query)? {
+                            out.push(Ok(IntoOwnedRow::into_owned(row?, &mut cache)));
+                        }
+                    }
+                    Ok(out)
+                })
+            })
+            .map_ok(|rows| futures_util::stream::iter(rows).boxed())
+            .boxed()
         }
     }
 
@@ -447,35 +556,23 @@ mod implementation {
             // SpawnBlocking bounds
             S: SpawnBlocking,
         {
-            let backend = C::Backend::default();
+            let query = self.with_inner(|inner| prepare_query(inner, &query));
 
-            let (collect_bind_result, collector_data) = {
-                let exclusive = self.inner.clone();
-                let mut inner = exclusive.lock().unwrap_or_else(|poison| {
-                    // try to be resilient by providing the guard
-                    exclusive.clear_poison();
-                    poison.into_inner()
-                });
-                let mut bind_collector =
-                    <<C::Backend as Backend>::BindCollector<'_> as Default>::default();
-                let metadata_lookup = inner.metadata_lookup();
-                let result = query.collect_binds(&mut bind_collector, metadata_lookup, &backend);
-                let collector_data = bind_collector.moveable();
+            self.spawn_blocking(|inner| callback(inner, &query?))
+        }
 
-                (result, collector_data)
-            };
-
-            let mut query_builder = <<C::Backend as Backend>::QueryBuilder as Default>::default();
-            let sql = query
-                .to_sql(&mut query_builder, &backend)
-                .map(|_| query_builder.finish());
-            let is_safe_to_cache_prepared = query.is_safe_to_cache_prepared(&backend);
-
-            self.spawn_blocking(|inner| {
-                collect_bind_result?;
-                let query = CollectedQuery::new(sql?, is_safe_to_cache_prepared?, collector_data);
-                callback(inner, &query)
-            })
+        /// Run the given closure with a lock on the inner connection
+        ///
+        /// This is only intended for short synchronous operations
+        /// like collecting bind values
+        fn with_inner<R>(&self, f: impl FnOnce(&mut C) -> R) -> R {
+            let exclusive = self.inner.clone();
+            let mut inner = exclusive.lock().unwrap_or_else(|poison| {
+                // try to be resilient by providing the guard
+                exclusive.clear_poison();
+                poison.into_inner()
+            });
+            f(&mut inner)
         }
 
         /// Gets an exclusive access to the underlying diesel Connection

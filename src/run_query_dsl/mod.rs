@@ -1,3 +1,5 @@
+#[cfg(feature = "sqlite")]
+mod sqlite_batch_insert;
 mod utils;
 
 #[cfg(any(feature = "mysql", feature = "mariadb"))]
@@ -25,11 +27,16 @@ use std::future::Future;
 /// However, generic code may need to include a where clause that references
 /// these traits.
 pub mod methods {
+    #[cfg(feature = "sqlite")]
+    #[doc(hidden)]
+    pub use super::sqlite_batch_insert::ExecuteStatementsInTransaction;
     use super::*;
     use diesel::backend::Backend;
     use diesel::deserialize::FromSqlRow;
     use diesel::expression::QueryMetadata;
-    use diesel::query_builder::{AsQuery, QueryFragment, QueryId};
+    use diesel::query_builder::{
+        AsQuery, Query, QueryExecutionStrategy, QueryFragment, QueryId, SingleQueryStrategy,
+    };
     use diesel::query_dsl::CompatibleType;
     use futures_util::{Future, Stream};
 
@@ -58,7 +65,8 @@ pub mod methods {
     where
         Conn: AsyncConnectionCore<Backend = DB>,
         DB: Backend,
-        T: QueryFragment<DB> + QueryId + Send,
+        T: QueryExecutionStrategy<DB>
+            + ExecuteWithStrategy<Conn, DB, <T as QueryExecutionStrategy<DB>>::Strategy>,
     {
         fn execute<'conn, 'query>(
             query: Self,
@@ -67,7 +75,42 @@ pub mod methods {
         where
             Self: 'query,
         {
-            conn.execute_returning_count(query)
+            query.execute_with_strategy(conn)
+        }
+    }
+
+    /// Execute a query according to its [`QueryExecutionStrategy`]
+    ///
+    /// This is an implementation detail of [`ExecuteDsl`] and
+    /// should not be used directly.
+    #[doc(hidden)]
+    pub trait ExecuteWithStrategy<Conn, DB, Strategy>
+    where
+        Conn: AsyncConnectionCore<Backend = DB>,
+        DB: Backend,
+    {
+        fn execute_with_strategy<'conn, 'query>(
+            self,
+            conn: &'conn mut Conn,
+        ) -> Conn::ExecuteFuture<'conn, 'query>
+        where
+            Self: 'query;
+    }
+
+    impl<Conn, DB, T> ExecuteWithStrategy<Conn, DB, SingleQueryStrategy> for T
+    where
+        Conn: AsyncConnectionCore<Backend = DB>,
+        DB: Backend,
+        T: QueryFragment<DB> + QueryId + Send,
+    {
+        fn execute_with_strategy<'conn, 'query>(
+            self,
+            conn: &'conn mut Conn,
+        ) -> Conn::ExecuteFuture<'conn, 'query>
+        where
+            Self: 'query,
+        {
+            conn.execute_returning_count(self)
         }
     }
 
@@ -93,16 +136,65 @@ pub mod methods {
         fn internal_load(self, conn: &mut Conn) -> Self::LoadFuture<'_>;
     }
 
-    impl<'query, Conn, DB, T, U, ST> LoadQuery<'query, Conn, U> for T
+    impl<'query, Conn, DB, T, U> LoadQuery<'query, Conn, U> for T
+    where
+        Conn: AsyncConnectionCore<Backend = DB>,
+        DB: Backend,
+        T: AsQuery + Send + 'query,
+        T::Query: QueryExecutionStrategy<DB>
+            + LoadWithStrategy<'query, Conn, U, <T::Query as QueryExecutionStrategy<DB>>::Strategy>,
+    {
+        type LoadFuture<'conn>
+            = <T::Query as LoadWithStrategy<
+            'query,
+            Conn,
+            U,
+            <T::Query as QueryExecutionStrategy<DB>>::Strategy,
+        >>::LoadFuture<'conn>
+        where
+            Conn: 'conn;
+
+        type Stream<'conn>
+            = <T::Query as LoadWithStrategy<
+            'query,
+            Conn,
+            U,
+            <T::Query as QueryExecutionStrategy<DB>>::Strategy,
+        >>::Stream<'conn>
+        where
+            Conn: 'conn;
+
+        fn internal_load(self, conn: &mut Conn) -> Self::LoadFuture<'_> {
+            self.as_query().load_with_strategy(conn)
+        }
+    }
+
+    /// Load a query according to its [`QueryExecutionStrategy`]
+    ///
+    /// This is an implementation detail of [`LoadQuery`] and
+    /// should not be used directly.
+    #[doc(hidden)]
+    pub trait LoadWithStrategy<'query, Conn: AsyncConnectionCore, U, Strategy> {
+        type LoadFuture<'conn>: Future<Output = QueryResult<Self::Stream<'conn>>> + Send
+        where
+            Conn: 'conn;
+
+        type Stream<'conn>: Stream<Item = QueryResult<U>> + Send
+        where
+            Conn: 'conn;
+
+        fn load_with_strategy(self, conn: &mut Conn) -> Self::LoadFuture<'_>;
+    }
+
+    impl<'query, Conn, DB, Q, U, ST> LoadWithStrategy<'query, Conn, U, SingleQueryStrategy> for Q
     where
         Conn: AsyncConnectionCore<Backend = DB>,
         U: Send,
         DB: Backend + 'static,
-        T: AsQuery + Send + 'query,
-        T::Query: QueryFragment<DB> + QueryId + Send + 'query,
-        T::SqlType: CompatibleType<U, DB, SqlType = ST>,
+        Q: Query + QueryFragment<DB> + QueryId + Send + 'query,
+        Q::SqlType: CompatibleType<U, DB, SqlType = ST>,
         U: FromSqlRow<ST, DB> + Send + 'static,
-        DB: QueryMetadata<T::SqlType>,
+        DB: QueryMetadata<Q::SqlType>,
         ST: 'static,
     {
         type LoadFuture<'conn>
@@ -118,7 +210,7 @@ pub mod methods {
         where
             Conn: 'conn;
 
-        fn internal_load(self, conn: &mut Conn) -> Self::LoadFuture<'_> {
+        fn load_with_strategy(self, conn: &mut Conn) -> Self::LoadFuture<'_> {
             utils::MapOk::new(conn.load(self), |stream| {
                 stream.map(|row| {
                     U::build_from_row(&row?).map_err(diesel::result::Error::DeserializationError)
