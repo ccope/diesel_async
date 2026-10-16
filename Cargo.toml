@@ -130,4 +130,4 @@ members = [
 ]
 
 [patch.crates-io]
-diesel = { path = "../diesel/diesel" }
+diesel = { git = "https://github.com/ccope/diesel", branch = "sqlite-batch-insert-third-party" }
